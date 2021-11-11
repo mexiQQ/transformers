@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Fine-tuning a 🤗 Transformers model for question answering using 🤗 Accelerate.
+Fine-tuning a 🤗 Transformers model on question answering.
 """
 # You can also adapt this script on your own question answering task. Pointers for this are left as comments.
 
@@ -25,6 +25,7 @@ import os
 import random
 from pathlib import Path
 
+from datetime import datetime
 import datasets
 import numpy as np
 import torch
@@ -53,10 +54,11 @@ from transformers.file_utils import get_full_repo_name
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 from utils_qa import postprocess_qa_predictions
-
+from pruner import Prune
+from torch.nn import CrossEntropyLoss, MSELoss
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.13.0.dev0")
+check_min_version("4.12.0.dev0")
 
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/question-answering/requirements.txt")
 
@@ -161,6 +163,12 @@ def parse_args():
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
     parser.add_argument(
+        "--eval_step",
+        type=int,
+        default=200,
+        help="eval step",
+    )
+    parser.add_argument(
         "--lr_scheduler_type",
         type=SchedulerType,
         default="linear",
@@ -240,6 +248,26 @@ def parse_args():
         "--hub_model_id", type=str, help="The name of the repository to keep in sync with the local `output_dir`."
     )
     parser.add_argument("--hub_token", type=str, help="The token to use to push to the Model Hub.")
+
+    parser.add_argument('--jiant_prepruned_weight', type=str, default="")
+    parser.add_argument('--temperature', type=float, default=1.)
+    parser.add_argument('--kd', action='store_true')
+    parser.add_argument('--prune', action='store_true')
+    parser.add_argument('--extract_mask', action='store_true')
+    # parser.add_argument('--early_stop', action='store_true')
+    # parser.add_argument('--early_stop_metric', type=str, default='acc', help='Early stop metric')
+    parser.add_argument('--fixed_mask', default=None, type=str, help="Fixed mask path.")
+    parser.add_argument('--mask', default=None, type=str, help="mask path")
+    # parser.add_argument('--sparse_mnli_init', default=None, type=str, help="MNLI weight initialization.")
+    parser.add_argument('--pruning_sparsity',type=float, default=0.875, help='sparsity')
+    parser.add_argument("--current_step", default=0, type=int, help="current step.")
+    parser.add_argument("--start_epoch", default=0, type=int, help="current step.")
+    parser.add_argument('--deploy_device',type=str, default='none', help='also known as balance. options none, fix=asic, fpga')
+    parser.add_argument('--group_size',type=int, default=64, help='also known as bank_size')
+    parser.add_argument('--pruning_frequency',type=int, default=800, help='also known as bank_size')
+    parser.add_argument('--pruning_epochs',type=int, default=0, help='pruning epochs')
+    parser.add_argument('--local_rank',type=int, default=0, help='rank')
+
     args = parser.parse_args()
 
     # Sanity checks
@@ -278,7 +306,6 @@ def main():
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
-    logger.info(accelerator.state)
 
     # Setup logging, we only want one process per machine to log things on the screen.
     # accelerator.is_local_main_process is only True for one process per machine.
@@ -304,6 +331,16 @@ def main():
             repo = Repository(args.output_dir, clone_from=repo_name)
         elif args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
+
+    if accelerator.is_main_process:
+        logfilename = 'log_dd{}_gs{}_bs{}_lr{}_sp{}_{}.txt'.format(args.deploy_device, args.group_size, args.per_device_train_batch_size, args.learning_rate, args.pruning_sparsity, datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
+        logfilename = os.path.join(args.output_dir, logfilename)
+        handler = logging.FileHandler(logfilename)
+        logger.addHandler(handler)
+        logger.info('------------> log file =={}'.format(logfilename))
+        logger.info(args)
+
+    logger.info(accelerator.state)
     accelerator.wait_for_everyone()
 
     # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
@@ -354,19 +391,47 @@ def main():
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
+    teacher = None
     if args.model_name_or_path:
         model = AutoModelForQuestionAnswering.from_pretrained(
             args.model_name_or_path,
             from_tf=bool(".ckpt" in args.model_name_or_path),
             config=config,
         )
+        if args.kd:
+            teacher = AutoModelForQuestionAnswering.from_pretrained(
+                args.model_name_or_path,
+                from_tf=bool(".ckpt" in args.model_name_or_path),
+                config=config,
+            ) 
     else:
         logger.info("Training new model from scratch")
         model = AutoModelForQuestionAnswering.from_config(config)
+        if args.kd:
+            teacher = AutoModelForQuestionAnswering.from_config(config)
+
+    if args.jiant_prepruned_weight:
+        weights_dict = torch.load(args.jiant_prepruned_weight)
+        keys = list(weights_dict.keys())
+
+        if "encoder" in keys[0]:
+            from collections import OrderedDict
+            weights = []
+            for k, v in weights_dict.items():
+                # if k == "classifier.weight" or k == "classifier.bias":
+                #     weights.append((f"taskmodels_dict.mnli.head.{k}", v))
+                # else:
+                if not k.startswith("taskmodels_dict") and "pooler" not in k:
+                    weights.append((f"bert.{'.'.join(k.split('.')[1:])}", v))
+                elif "qa_outputs" in k:
+                    weights.append(('.'.join(k.split('.')[-2:]), v))
+            weights_dict = OrderedDict(weights)
+
+        output = model.load_state_dict(weights_dict, strict=False)
+        logger.info(f"Load weight result: {output}")
 
     # Preprocessing the datasets.
     # Preprocessing is slighlty different for training and evaluation.
-
     column_names = raw_datasets["train"].column_names
 
     question_column_name = "question" if "question" in column_names else column_names[0]
@@ -464,14 +529,14 @@ def main():
 
     if "train" not in raw_datasets:
         raise ValueError("--do_train requires a train dataset")
-    train_dataset = raw_datasets["train"]
+    train_examples = raw_datasets["train"]
     if args.max_train_samples is not None:
         # We will select sample from whole data if agument is specified
-        train_dataset = train_dataset.select(range(args.max_train_samples))
+        train_examples = train_examples.select(range(args.max_train_samples))
 
     # Create train feature from dataset
     with accelerator.main_process_first():
-        train_dataset = train_dataset.map(
+        train_dataset = train_examples.map(
             prepare_train_features,
             batched=True,
             num_proc=args.preprocessing_num_workers,
@@ -536,6 +601,7 @@ def main():
     if args.max_eval_samples is not None:
         # We will select sample from whole data
         eval_examples = eval_examples.select(range(args.max_eval_samples))
+
     # Validation Feature Creation
     with accelerator.main_process_first():
         eval_dataset = eval_examples.map(
@@ -547,30 +613,39 @@ def main():
             desc="Running tokenizer on validation dataset",
         )
 
-    if args.max_eval_samples is not None:
-        # During Feature creation dataset samples might increase, we will select required samples again
-        eval_dataset = eval_dataset.select(range(args.max_eval_samples))
+        if args.max_eval_samples is not None:
+            # During Feature creation dataset samples might increase, we will select required samples again
+            eval_dataset = eval_dataset.select(range(args.max_eval_samples))
 
-    if args.do_predict:
-        if "test" not in raw_datasets:
-            raise ValueError("--do_predict requires a test dataset")
-        predict_examples = raw_datasets["test"]
-        if args.max_predict_samples is not None:
-            # We will select sample from whole data
-            predict_examples = predict_examples.select(range(args.max_predict_samples))
-        # Predict Feature Creation
-        with accelerator.main_process_first():
-            predict_dataset = predict_examples.map(
-                prepare_validation_features,
-                batched=True,
-                num_proc=args.preprocessing_num_workers,
-                remove_columns=column_names,
-                load_from_cache_file=not args.overwrite_cache,
-                desc="Running tokenizer on prediction dataset",
-            )
-            if args.max_predict_samples is not None:
-                # During Feature creation dataset samples might increase, we will select required samples again
-                predict_dataset = predict_dataset.select(range(args.max_predict_samples))
+        eval_train_dataset = train_examples.map(
+            prepare_validation_features,
+            batched=True,
+            num_proc=args.preprocessing_num_workers,
+            remove_columns=column_names,
+            load_from_cache_file=not args.overwrite_cache,
+            desc="Running tokenizer on validation dataset",
+        )
+
+    # if args.do_predict:
+    #     if "test" not in raw_datasets:
+    #         raise ValueError("--do_predict requires a test dataset")
+    #     predict_examples = raw_datasets["test"]
+    #     if args.max_predict_samples is not None:
+    #         # We will select sample from whole data
+    #         predict_examples = predict_examples.select(range(args.max_predict_samples))
+    #     # Predict Feature Creation
+    #     with accelerator.main_process_first():
+    #         predict_dataset = predict_examples.map(
+    #             prepare_validation_features,
+    #             batched=True,
+    #             num_proc=args.preprocessing_num_workers,
+    #             remove_columns=column_names,
+    #             load_from_cache_file=not args.overwrite_cache,
+    #             desc="Running tokenizer on prediction dataset",
+    #         )
+    #         if args.max_predict_samples is not None:
+    #             # During Feature creation dataset samples might increase, we will select required samples again
+    #             predict_dataset = predict_dataset.select(range(args.max_predict_samples))
 
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 3):
@@ -591,16 +666,21 @@ def main():
         train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
     )
 
+    eval_train_dataset_for_model = eval_train_dataset.remove_columns(["example_id", "offset_mapping"])
+    eval_train_dataloader = DataLoader(
+        eval_train_dataset_for_model, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size
+    ) 
+
     eval_dataset_for_model = eval_dataset.remove_columns(["example_id", "offset_mapping"])
     eval_dataloader = DataLoader(
         eval_dataset_for_model, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size
     )
 
-    if args.do_predict:
-        predict_dataset_for_model = predict_dataset.remove_columns(["example_id", "offset_mapping"])
-        predict_dataloader = DataLoader(
-            predict_dataset_for_model, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size
-        )
+    # if args.do_predict:
+    #     predict_dataset_for_model = predict_dataset.remove_columns(["example_id", "offset_mapping"])
+    #     predict_dataloader = DataLoader(
+    #         predict_dataset_for_model, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size
+    #     )
 
     # Post-processing:
     def post_processing_function(examples, features, predictions, stage="eval"):
@@ -677,10 +757,10 @@ def main():
     ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
 
-    # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader
+    model, teacher, optimizer, train_dataloader, eval_dataloader, eval_train_dataloader = accelerator.prepare(
+        model, teacher, optimizer, train_dataloader, eval_dataloader, eval_train_dataloader 
     )
+    # Prepare everything with our `accelerator`.
 
     # Note -> the training dataloader needs to be prepared before we grab his length below (cause its length will be
     # shorter in multiprocess)
@@ -695,9 +775,41 @@ def main():
     lr_scheduler = get_scheduler(
         name=args.lr_scheduler_type,
         optimizer=optimizer,
-        num_warmup_steps=args.num_warmup_steps,
+        # num_warmup_steps=args.num_warmup_steps,
+        num_warmup_steps=int(args.max_train_steps * 0.1),
         num_training_steps=args.max_train_steps,
     )
+
+    prune_dict = {}
+    for k, v in model.named_parameters():
+        # FF nn
+        if ('intermediate.dense.weight' in k or 'output.dense.weight' in k) and ('attention.output.dense.weight' not in k):
+            prune_dict[k] = args.pruning_sparsity
+        # Att nn
+        if 'attention.self.query.weight' in k or 'attention.self.key.weight' in k or 'attention.self.value.weight' in k or 'attention.output.dense.weight' in k:
+            prune_dict[k] = args.pruning_sparsity
+
+    
+    pruner = None
+    if args.prune:
+        pruner = Prune(
+            model=model, 
+            pretrain_step=0,
+            sparse_step=num_update_steps_per_epoch * args.pruning_epochs,
+            current_step=args.current_step,
+            frequency=args.pruning_frequency,
+            prune_dict=prune_dict,
+            restore_sparsity=False,
+            fix_sparsity=False,
+            prune_device='default',
+            deploy_device=args.deploy_device,
+            group_size=args.group_size,
+            fixed_mask=args.fixed_mask,
+            mask=args.mask
+        )
+
+    if teacher:
+        teacher.eval()
 
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -709,17 +821,74 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
-
+    
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     completed_steps = 0
 
+    def soft_cross_entropy(predicts, targets):
+        student_likelihood = torch.nn.functional.log_softmax(predicts, dim=-1)
+        targets_prob = torch.nn.functional.softmax(targets, dim=-1)
+        return (- targets_prob * student_likelihood).mean()
+
+    highest_score = 0
+    tr_att_loss = 0
+    tr_rep_loss = 0
+    tr_cls_loss = 0
+    tr_loss = 0
+
+    evaluate(eval_dataset, args, eval_dataloader, model, accelerator, create_and_fill_np_array, post_processing_function, eval_examples, metric)
+
+    loss_mse = MSELoss()
     for epoch in range(args.num_train_epochs):
         model.train()
         for step, batch in enumerate(train_dataloader):
-            outputs = model(**batch)
-            loss = outputs.loss
+            outputs = model(**batch, output_hidden_states=True, output_attentions=True)
+            student_loss = outputs.loss
+            student_start_logits = outputs.start_logits
+            student_end_logits = outputs.end_logits
+            student_hidden_states = outputs.hidden_states
+            student_attentions = outputs.attentions
+
+            if teacher:
+                teacher_outputs = teacher(**batch, output_hidden_states=True, output_attentions=True)
+                teacher_start_logits = teacher_outputs.start_logits
+                teacher_end_logits = teacher_outputs.end_logits
+                teacher_hidden_states = teacher_outputs.hidden_states
+                teacher_attentions = teacher_outputs.attentions
+
+            att_loss = torch.zeros(1)
+            rep_loss = torch.zeros(1)
+            cls_loss = torch.zeros(1)
+            loss = torch.zeros(1)
+
+            if args.kd:
+                for student_att, teacher_att in zip(student_attentions[10:], teacher_attentions[10:]):
+                    student_att = torch.where(student_att <= -1e2, torch.zeros_like(student_att), student_att, )
+                    teacher_att = torch.where(teacher_att <= -1e2, torch.zeros_like(teacher_att), teacher_att)
+                    tmp_loss = loss_mse(student_att, teacher_att)
+                    att_loss += tmp_loss
+
+                for student_rep, teacher_rep in zip(student_hidden_states[10:], teacher_hidden_states[10:]):
+                    tmp_loss = loss_mse(student_rep, teacher_rep)
+                    rep_loss += tmp_loss                        
+
+                cls_loss = soft_cross_entropy(
+                    student_start_logits / args.temperature, teacher_start_logits / args.temperature)
+                cls_loss += soft_cross_entropy(
+                    student_end_logits / args.temperature, teacher_end_logits / args.temperature) 
+            
+                loss = rep_loss + att_loss + cls_loss
+            else:
+                loss = student_loss                
+
+            # loss = outputs.loss
             loss = loss / args.gradient_accumulation_steps
+            tr_att_loss += att_loss.item()
+            tr_rep_loss += rep_loss.item()
+            tr_cls_loss += cls_loss.item()
+            tr_loss += loss.item()
+
             accelerator.backward(loss)
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                 optimizer.step()
@@ -727,6 +896,32 @@ def main():
                 optimizer.zero_grad()
                 progress_bar.update(1)
                 completed_steps += 1
+
+                if pruner:
+                   pruner.prune()
+
+                if accelerator.is_main_process:
+                    # optimized step, loss, att_loss, rep_loss, cls loss, tr_loss, tr_att_loss, tr_rep_loss, tr_cls_loss 
+                    logger.info("{:0>6d}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}".format(
+                        completed_steps,
+                        loss.item(),
+                        att_loss.item(),
+                        rep_loss.item(),
+                        cls_loss.item(),
+                        tr_loss / completed_steps,
+                        tr_att_loss / completed_steps,
+                        tr_rep_loss / completed_steps,
+                        tr_cls_loss / completed_steps)
+                    )
+                
+            if completed_steps % args.eval_step == 0:
+                if pruner and accelerator.is_main_process:
+                    layer_sparse_rate, total_sparse_rate = pruner.sparsity()
+                    logger.info('\nepoch %d; step=%d; weight sparsity=%s; layer weight sparsity=%s\n' % (epoch, step, total_sparse_rate, layer_sparse_rate))
+
+                res_score = evaluate(eval_dataset, args, eval_dataloader, model, accelerator, create_and_fill_np_array, post_processing_function, eval_examples, metric)
+
+                highest_score = max(highest_score, res_score)
 
             if completed_steps >= args.max_train_steps:
                 break
@@ -737,11 +932,27 @@ def main():
             unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
             if accelerator.is_main_process:
                 tokenizer.save_pretrained(args.output_dir)
-                repo.push_to_hub(
-                    commit_message=f"Training in progress epoch {epoch}", blocking=False, auto_lfs_prune=True
-                )
+                repo.push_to_hub(commit_message=f"Training in progress epoch {epoch}", blocking=False)
 
-    # Evaluation
+    evaluate(eval_train_dataset, args, eval_train_dataloader, model, accelerator, create_and_fill_np_array, post_processing_function, train_examples, metric)
+
+    evaluate(eval_dataset, args, eval_dataloader, model, accelerator, create_and_fill_np_array, post_processing_function, eval_examples, metric)
+
+    logger.info(f"Highest score: {highest_score}")
+   
+    if args.output_dir is not None:
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            unwrapped_model = accelerator.unwrap_model(model)
+            unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
+            tokenizer.save_pretrained(args.output_dir)
+            if args.push_to_hub:
+                repo.push_to_hub(commit_message="End of training")
+
+    torch.distributed.destroy_process_group()
+
+def evaluate(eval_dataset, args, eval_dataloader, model, accelerator, create_and_fill_np_array, post_processing_function, eval_examples, metric):
+     # Evaluation
     logger.info("***** Running Evaluation *****")
     logger.info(f"  Num examples = {len(eval_dataset)}")
     logger.info(f"  Batch size = {args.per_device_eval_batch_size}")
@@ -776,50 +987,42 @@ def main():
     eval_metric = metric.compute(predictions=prediction.predictions, references=prediction.label_ids)
     logger.info(f"Evaluation metrics: {eval_metric}")
 
-    # Prediction
-    if args.do_predict:
-        logger.info("***** Running Prediction *****")
-        logger.info(f"  Num examples = {len(predict_dataset)}")
-        logger.info(f"  Batch size = {args.per_device_eval_batch_size}")
-
-        all_start_logits = []
-        all_end_logits = []
-        for step, batch in enumerate(predict_dataloader):
-            with torch.no_grad():
-                outputs = model(**batch)
-                start_logits = outputs.start_logits
-                end_logits = outputs.end_logits
-
-                if not args.pad_to_max_length:  # necessary to pad predictions and labels for being gathered
-                    start_logits = accelerator.pad_across_processes(start_logits, dim=1, pad_index=-100)
-                    end_logits = accelerator.pad_across_processes(start_logits, dim=1, pad_index=-100)
-
-                all_start_logits.append(accelerator.gather(start_logits).cpu().numpy())
-                all_end_logits.append(accelerator.gather(end_logits).cpu().numpy())
-
-        max_len = max([x.shape[1] for x in all_start_logits])  # Get the max_length of the tensor
-        # concatenate the numpy array
-        start_logits_concat = create_and_fill_np_array(all_start_logits, predict_dataset, max_len)
-        end_logits_concat = create_and_fill_np_array(all_end_logits, predict_dataset, max_len)
-
-        # delete the list of numpy arrays
-        del all_start_logits
-        del all_end_logits
-
-        outputs_numpy = (start_logits_concat, end_logits_concat)
-        prediction = post_processing_function(predict_examples, predict_dataset, outputs_numpy)
-        predict_metric = metric.compute(predictions=prediction.predictions, references=prediction.label_ids)
-        logger.info(f"Predict metrics: {predict_metric}")
-
-    if args.output_dir is not None:
-        accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
-        if accelerator.is_main_process:
-            tokenizer.save_pretrained(args.output_dir)
-            if args.push_to_hub:
-                repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
-
+    return (eval_metric["exact_match"] + eval_metric["f1"]) / 2 
 
 if __name__ == "__main__":
     main()
+
+ # # Prediction
+    # if args.do_predict:
+    #     logger.info("***** Running Prediction *****")
+    #     logger.info(f"  Num examples = {len(predict_dataset)}")
+    #     logger.info(f"  Batch size = {args.per_device_eval_batch_size}")
+
+    #     all_start_logits = []
+    #     all_end_logits = []
+    #     for step, batch in enumerate(predict_dataloader):
+    #         with torch.no_grad():
+    #             outputs = model(**batch)
+    #             start_logits = outputs.start_logits
+    #             end_logits = outputs.end_logits
+
+    #             if not args.pad_to_max_length:  # necessary to pad predictions and labels for being gathered
+    #                 start_logits = accelerator.pad_across_processes(start_logits, dim=1, pad_index=-100)
+    #                 end_logits = accelerator.pad_across_processes(start_logits, dim=1, pad_index=-100)
+
+    #             all_start_logits.append(accelerator.gather(start_logits).cpu().numpy())
+    #             all_end_logits.append(accelerator.gather(end_logits).cpu().numpy())
+
+    #     max_len = max([x.shape[1] for x in all_start_logits])  # Get the max_length of the tensor
+    #     # concatenate the numpy array
+    #     start_logits_concat = create_and_fill_np_array(all_start_logits, predict_dataset, max_len)
+    #     end_logits_concat = create_and_fill_np_array(all_end_logits, predict_dataset, max_len)
+
+    #     # delete the list of numpy arrays
+    #     del all_start_logits
+    #     del all_end_logits
+
+    #     outputs_numpy = (start_logits_concat, end_logits_concat)
+    #     prediction = post_processing_function(predict_examples, predict_dataset, outputs_numpy)
+    #     predict_metric = metric.compute(predictions=prediction.predictions, references=prediction.label_ids)
+    #     logger.info(f"Predict metrics: {predict_metric}")
