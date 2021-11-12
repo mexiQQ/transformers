@@ -53,29 +53,30 @@
 # CUDA_VISIBLE_DEVICES=1,2,3 WORLD_SIZE=3 python -m torch.distributed.launch --nproc_per_node 3 --master_port 42475 
 # csarron/bert-base-uncased-squad-v1
 # /ssd/jianwei/transformers/examples/pytorch/question-answering/runs/200_epoch
-
-# OMP_NUM_THREADS=1 CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch run_qa_no_trainer.py \
-python run_qa_no_trainer.py \
+  
+# CUDA_VISIBLE_DEVICES=0 python run_qa_no_trainer.py \
+OMP_NUM_THREADS=1 CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch run_qa_no_trainer.py \
   --model_name_or_path csarron/bert-base-uncased-squad-v1 \
   --dataset_name squad \
   --overwrite_cache True\
-  --per_device_train_batch_size 8 \
-  --per_device_eval_batch_size 8 \
-  --num_train_epochs 3 \
-  --learning_rate 3e-5 \
-  --weight_decay 0.05 \
-  --max_seq_length 384 \
-  --eval_step 1 \
+  --per_device_train_batch_size 16 \
+  --per_device_eval_batch_size 16 \
+  --num_train_epochs 200 \
+  --learning_rate 5e-5 \
+  --weight_decay 0.01 \
+  --max_seq_length 248 \
+  --eval_step 200 \
   --doc_stride 128 \
-  --output_dir /content/drive/MyDrive/moffett.ai/transformers-experiments
+  --output_dir /content/drive/MyDrive/moffett.ai/transformers-experiments \
+  --pruning_sparsity 0.9375 \
+  --prune \
+  --pruning_epochs 160 \
+  --pruning_frequency 400 \
+  --deploy_device none \
+  --group_size 64 \
+  --kd \
+  # --max_train_samples 500
   # --jiant_prepruned_weight /ssd/jianwei/jiant/moffett/runs/bbs_moffett_nlp_experiment_on_squad_v1_Test_7_lr_1.5e-05_bs_16_te_40_ef_200/best_model.p
-  # --pruning_sparsity 0.9375 \
-  # --prune \
-  # --pruning_epochs 160 \
-  # --pruning_frequency 2000 \
-  # --deploy_device none \
-  # --group_size 64
-  # --kd
 
 
 # OMP_NUM_THREADS=1 CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch run_qa_no_trainer.py \
