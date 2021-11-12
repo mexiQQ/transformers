@@ -920,7 +920,7 @@ def main():
                     logger.info('\nepoch %d; step=%d; weight sparsity=%s; layer weight sparsity=%s\n' % (epoch, step, total_sparse_rate, layer_sparse_rate))
 
                 res_score = evaluate(eval_dataset, args, eval_dataloader, model, accelerator, create_and_fill_np_array, post_processing_function, eval_examples, metric)
-
+                model.train()
                 highest_score = max(highest_score, res_score)
 
             if completed_steps >= args.max_train_steps:
@@ -952,7 +952,9 @@ def main():
     torch.distributed.destroy_process_group()
 
 def evaluate(eval_dataset, args, eval_dataloader, model, accelerator, create_and_fill_np_array, post_processing_function, eval_examples, metric):
-     # Evaluation
+    # Evaluation
+    model.eval()
+    
     logger.info("***** Running Evaluation *****")
     logger.info(f"  Num examples = {len(eval_dataset)}")
     logger.info(f"  Batch size = {args.per_device_eval_batch_size}")
