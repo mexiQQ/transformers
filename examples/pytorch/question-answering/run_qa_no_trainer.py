@@ -404,11 +404,13 @@ def main():
                 from_tf=bool(".ckpt" in args.model_name_or_path),
                 config=config,
             ) 
+            teacher.eval()
     else:
         logger.info("Training new model from scratch")
         model = AutoModelForQuestionAnswering.from_config(config)
         if args.kd:
             teacher = AutoModelForQuestionAnswering.from_config(config)
+            teacher.eval()
 
     if args.jiant_prepruned_weight:
         weights_dict = torch.load(args.jiant_prepruned_weight)
@@ -760,6 +762,7 @@ def main():
     model, teacher, optimizer, train_dataloader, eval_dataloader, eval_train_dataloader = accelerator.prepare(
         model, teacher, optimizer, train_dataloader, eval_dataloader, eval_train_dataloader 
     )
+
     # Prepare everything with our `accelerator`.
 
     # Note -> the training dataloader needs to be prepared before we grab his length below (cause its length will be
@@ -808,9 +811,6 @@ def main():
             mask=args.mask
         )
 
-    if teacher:
-        teacher.eval()
-
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
@@ -823,7 +823,7 @@ def main():
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     
     # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+    # progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     completed_steps = 0
 
     def soft_cross_entropy(predicts, targets):
@@ -837,8 +837,6 @@ def main():
     tr_cls_loss = 0
     tr_loss = 0
 
-    evaluate(eval_dataset, args, eval_dataloader, model, accelerator, create_and_fill_np_array, post_processing_function, eval_examples, metric)
-
     loss_mse = MSELoss()
     for epoch in range(args.num_train_epochs):
         model.train()
@@ -851,21 +849,22 @@ def main():
             student_attentions = outputs.attentions
 
             if teacher:
-                teacher_outputs = teacher(**batch, output_hidden_states=True, output_attentions=True)
-                teacher_start_logits = teacher_outputs.start_logits
-                teacher_end_logits = teacher_outputs.end_logits
-                teacher_hidden_states = teacher_outputs.hidden_states
-                teacher_attentions = teacher_outputs.attentions
+                with torch.no_grad():
+                    teacher_outputs = teacher(**batch, output_hidden_states=True, output_attentions=True)
+                    teacher_start_logits = teacher_outputs.start_logits
+                    teacher_end_logits = teacher_outputs.end_logits
+                    teacher_hidden_states = teacher_outputs.hidden_states
+                    teacher_attentions = teacher_outputs.attentions
 
-            att_loss = torch.zeros(1)
-            rep_loss = torch.zeros(1)
-            cls_loss = torch.zeros(1)
-            loss = torch.zeros(1)
+            att_loss = torch.zeros(1).cuda()
+            rep_loss = torch.zeros(1).cuda()
+            cls_loss = torch.zeros(1).cuda()
+            loss = torch.zeros(1).cuda()
 
             if args.kd:
                 for student_att, teacher_att in zip(student_attentions[10:], teacher_attentions[10:]):
-                    student_att = torch.where(student_att <= -1e2, torch.zeros_like(student_att), student_att, )
-                    teacher_att = torch.where(teacher_att <= -1e2, torch.zeros_like(teacher_att), teacher_att)
+                    # student_att = torch.where(student_att <= -1e2, torch.zeros_like(student_att), student_att, )
+                    # teacher_att = torch.where(teacher_att <= -1e2, torch.zeros_like(teacher_att), teacher_att)
                     tmp_loss = loss_mse(student_att, teacher_att)
                     att_loss += tmp_loss
 
@@ -881,6 +880,7 @@ def main():
                 loss = rep_loss + att_loss + cls_loss
             else:
                 loss = student_loss                
+                assert loss, "The switch of loss computation is closed because of kd"
 
             # loss = outputs.loss
             loss = loss / args.gradient_accumulation_steps
@@ -894,16 +894,18 @@ def main():
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
-                progress_bar.update(1)
+                # progress_bar.update(1)
                 completed_steps += 1
 
                 if pruner:
                    pruner.prune()
 
+            if completed_steps % args.eval_step == 0:
                 if accelerator.is_main_process:
-                    # optimized step, loss, att_loss, rep_loss, cls loss, tr_loss, tr_att_loss, tr_rep_loss, tr_cls_loss 
-                    logger.info("{:0>6d}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}".format(
+	                    # optimized step, loss, att_loss, rep_loss, cls loss, tr_loss, tr_att_loss, tr_rep_loss, tr_cls_loss 
+                    logger.info("{:0>6d}/{:0>6d}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}".format(
                         completed_steps,
+                        args.max_train_steps, 
                         loss.item(),
                         att_loss.item(),
                         rep_loss.item(),
@@ -913,13 +915,13 @@ def main():
                         tr_rep_loss / completed_steps,
                         tr_cls_loss / completed_steps)
                     )
-                
-            if completed_steps % args.eval_step == 0:
+
                 if pruner and accelerator.is_main_process:
                     layer_sparse_rate, total_sparse_rate = pruner.sparsity()
-                    logger.info('\nepoch %d; step=%d; weight sparsity=%s; layer weight sparsity=%s\n' % (epoch, step, total_sparse_rate, layer_sparse_rate))
+                    logger.info('\nepoch %d; step=%d; weight sparsity=%s; layer weight sparsity=%s\n' % (epoch, completed_steps, total_sparse_rate, layer_sparse_rate))
 
                 res_score = evaluate(eval_dataset, args, eval_dataloader, model, accelerator, create_and_fill_np_array, post_processing_function, eval_examples, metric)
+                
                 model.train()
                 highest_score = max(highest_score, res_score)
 
@@ -952,9 +954,9 @@ def main():
     torch.distributed.destroy_process_group()
 
 def evaluate(eval_dataset, args, eval_dataloader, model, accelerator, create_and_fill_np_array, post_processing_function, eval_examples, metric):
-    # Evaluation
     model.eval()
-    
+
+    # Evaluation
     logger.info("***** Running Evaluation *****")
     logger.info(f"  Num examples = {len(eval_dataset)}")
     logger.info(f"  Batch size = {args.per_device_eval_batch_size}")
