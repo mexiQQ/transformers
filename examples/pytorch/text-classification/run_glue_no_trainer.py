@@ -156,6 +156,7 @@ def parse_args():
     parser.add_argument("--hub_token", type=str, help="The token to use to push to the Model Hub.")
 
     parser.add_argument('--jiant_prepruned_weight', type=str, default="")
+    parser.add_argument("--eval_step", default=200, type=int, help="eval step.")
     parser.add_argument('--temperature', type=float, default=1.)
     parser.add_argument('--kd', action='store_true')
     parser.add_argument('--prune', action='store_true')
@@ -583,7 +584,7 @@ def main():
                 if pruner:
                    pruner.prune()
 
-            if completed_steps % 200 == 0:
+            if completed_steps % args.eval_step == 0:
                 if accelerator.is_main_process:
 	                    # optimized step, loss, att_loss, rep_loss, cls loss, tr_loss, tr_att_loss, tr_rep_loss, tr_cls_loss 
                     logger.info("{:0>6d}/{:0>6d}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}".format(
@@ -603,20 +604,20 @@ def main():
                     layer_sparse_rate, total_sparse_rate = pruner.sparsity()
                     logger.info('\nepoch %d; step=%d; weight sparsity=%s; layer weight sparsity=%s\n' % (epoch, completed_steps, total_sparse_rate, layer_sparse_rate))
 
+                model.eval()
+                for step, batch in enumerate(eval_dataloader):
+                    outputs = model(**batch)
+                    predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
+                    metric.add_batch(
+                        predictions=accelerator.gather(predictions),
+                        references=accelerator.gather(batch["labels"]),
+                    )
+
+                eval_metric = metric.compute()
+                logger.info(f"epoch {epoch}, step {completed_steps}/{args.max_train_steps}: {eval_metric}")
+
             if completed_steps >= args.max_train_steps:
                 break
-
-        model.eval()
-        for step, batch in enumerate(eval_dataloader):
-            outputs = model(**batch)
-            predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
-            metric.add_batch(
-                predictions=accelerator.gather(predictions),
-                references=accelerator.gather(batch["labels"]),
-            )
-
-        eval_metric = metric.compute()
-        logger.info(f"epoch {epoch}: {eval_metric}")
 
         if args.push_to_hub and epoch < args.num_train_epochs - 1:
             accelerator.wait_for_everyone()
