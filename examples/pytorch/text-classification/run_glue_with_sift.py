@@ -18,6 +18,7 @@ import logging
 import math
 import os
 import random
+import torch
 from pathlib import Path
 
 import datasets
@@ -40,8 +41,11 @@ from transformers import (
     get_scheduler,
     set_seed,
 )
+from datetime import datetime
+from pruner import Prune
 from transformers.file_utils import get_full_repo_name
 from transformers.utils.versions import require_version
+from torch.nn import CrossEntropyLoss, MSELoss
 
 
 logger = logging.getLogger(__name__)
@@ -150,6 +154,27 @@ def parse_args():
         "--hub_model_id", type=str, help="The name of the repository to keep in sync with the local `output_dir`."
     )
     parser.add_argument("--hub_token", type=str, help="The token to use to push to the Model Hub.")
+
+    parser.add_argument('--jiant_prepruned_weight', type=str, default="")
+    parser.add_argument("--eval_step", default=200, type=int, help="eval step.")
+    parser.add_argument('--temperature', type=float, default=1.)
+    parser.add_argument('--kd', action='store_true')
+    parser.add_argument('--prune', action='store_true')
+    parser.add_argument('--extract_mask', action='store_true')
+    # parser.add_argument('--early_stop', action='store_true')
+    # parser.add_argument('--early_stop_metric', type=str, default='acc', help='Early stop metric')
+    parser.add_argument('--fixed_mask', default=None, type=str, help="Fixed mask path.")
+    parser.add_argument('--mask', default=None, type=str, help="mask path")
+    # parser.add_argument('--sparse_mnli_init', default=None, type=str, help="MNLI weight initialization.")
+    parser.add_argument('--pruning_sparsity',type=float, default=0.875, help='sparsity')
+    parser.add_argument("--current_step", default=0, type=int, help="current step.")
+    parser.add_argument("--start_epoch", default=0, type=int, help="current step.")
+    parser.add_argument('--deploy_device',type=str, default='none', help='also known as balance. options none, fix=asic, fpga')
+    parser.add_argument('--group_size',type=int, default=64, help='also known as bank_size')
+    parser.add_argument('--pruning_frequency',type=int, default=800, help='also known as bank_size')
+    parser.add_argument('--pruning_epochs',type=int, default=0, help='pruning epochs')
+    parser.add_argument('--local_rank',type=int, default=0, help='rank')
+
     args = parser.parse_args()
 
     # Sanity checks
@@ -180,7 +205,6 @@ def main():
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
-    logger.info(accelerator.state)
 
     # Setup logging, we only want one process per machine to log things on the screen.
     # accelerator.is_local_main_process is only True for one process per machine.
@@ -206,6 +230,16 @@ def main():
             repo = Repository(args.output_dir, clone_from=repo_name)
         elif args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
+
+    if accelerator.is_main_process:
+        logfilename = 'log_dd{}_gs{}_bs{}_lr{}_sp{}_{}.txt'.format(args.deploy_device, args.group_size, args.per_device_train_batch_size, args.learning_rate, args.pruning_sparsity, datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
+        logfilename = os.path.join(args.output_dir, logfilename)
+        handler = logging.FileHandler(logfilename)
+        logger.addHandler(handler)
+        logger.info('------------> log file =={}'.format(logfilename))
+        logger.info(args)
+
+    logger.info(accelerator.state)
     accelerator.wait_for_everyone()
 
     # Get the datasets: you can either provide your own CSV/JSON training and evaluation files (see below)
@@ -266,6 +300,35 @@ def main():
         from_tf=bool(".ckpt" in args.model_name_or_path),
         config=config,
     )
+
+    teacher = None
+    if args.kd:
+        teacher = AutoModelForSequenceClassification.from_pretrained(
+            args.model_name_or_path,
+            from_tf=bool(".ckpt" in args.model_name_or_path),
+            config=config,
+        )
+        teacher.eval()
+
+    if args.jiant_prepruned_weight:
+        weights_dict = torch.load(args.jiant_prepruned_weight)
+        keys = list(weights_dict.keys())
+
+        if "encoder" in keys[0]:
+            from collections import OrderedDict
+            weights = []
+            for k, v in weights_dict.items():
+                # if k == "classifier.weight" or k == "classifier.bias":
+                #     weights.append((f"taskmodels_dict.mnli.head.{k}", v))
+                # else:
+                if not k.startswith("taskmodels_dict") and "pooler" not in k:
+                    weights.append((f"bert.{'.'.join(k.split('.')[1:])}", v))
+                elif "qa_outputs" in k:
+                    weights.append(('.'.join(k.split('.')[-2:]), v))
+            weights_dict = OrderedDict(weights)
+
+        output = model.load_state_dict(weights_dict, strict=False)
+        logger.info(f"Load weight result: {output}")
 
     # Preprocessing the datasets
     if args.task_name is not None:
@@ -377,9 +440,14 @@ def main():
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
 
     # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader
-    )
+    if args.kd:
+      model, teacher, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
+          model, teacher, optimizer, train_dataloader, eval_dataloader
+      )
+    else:
+      model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
+          model, optimizer, train_dataloader, eval_dataloader
+      )
 
     # Note -> the training dataloader needs to be prepared before we grab his length below (cause its length will be
     # shorter in multiprocess)
@@ -404,6 +472,34 @@ def main():
     else:
         metric = load_metric("accuracy")
 
+    prune_dict = {}
+    for k, v in model.named_parameters():
+        # FF nn
+        if ('intermediate.dense.weight' in k or 'output.dense.weight' in k) and ('attention.output.dense.weight' not in k):
+            prune_dict[k] = args.pruning_sparsity
+        # Att nn
+        if 'attention.self.query.weight' in k or 'attention.self.key.weight' in k or 'attention.self.value.weight' in k or 'attention.output.dense.weight' in k:
+            prune_dict[k] = args.pruning_sparsity
+
+    
+    pruner = None
+    if args.prune:
+        pruner = Prune(
+            model=model, 
+            pretrain_step=0,
+            sparse_step=num_update_steps_per_epoch * args.pruning_epochs,
+            current_step=args.current_step,
+            frequency=args.pruning_frequency,
+            prune_dict=prune_dict,
+            restore_sparsity=False,
+            fix_sparsity=False,
+            prune_device='default',
+            deploy_device=args.deploy_device,
+            group_size=args.group_size,
+            fixed_mask=args.fixed_mask,
+            mask=args.mask
+        )
+
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
@@ -414,38 +510,114 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
+
     # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+    # progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     completed_steps = 0
 
+    def soft_cross_entropy(predicts, targets):
+        student_likelihood = torch.nn.functional.log_softmax(predicts, dim=-1)
+        targets_prob = torch.nn.functional.softmax(targets, dim=-1)
+        return (- targets_prob * student_likelihood).mean()
+
+    tr_att_loss = 0
+    tr_rep_loss = 0
+    tr_cls_loss = 0
+    tr_loss = 0
+
+    loss_mse = MSELoss()
     for epoch in range(args.num_train_epochs):
         model.train()
         for step, batch in enumerate(train_dataloader):
-            outputs = model(**batch)
-            loss = outputs.loss
+            outputs = model(**batch, output_hidden_states=True, output_attentions=True)
+            student_loss = outputs.loss
+            student_logits = outputs.logits
+            student_hidden_states = outputs.hidden_states
+            student_attentions = outputs.attentions
+
+            if teacher:
+                with torch.no_grad():
+                    teacher_outputs = teacher(**batch, output_hidden_states=True, output_attentions=True)
+                    teacher_logits = teacher_outputs.logits
+                    teacher_hidden_states = teacher_outputs.hidden_states
+                    teacher_attentions = teacher_outputs.attentions
+
+            att_loss = torch.zeros(1).cuda()
+            rep_loss = torch.zeros(1).cuda()
+            cls_loss = torch.zeros(1).cuda()
+            loss = torch.zeros(1).cuda()
+            
+            if args.kd:
+                for student_att, teacher_att in zip(student_attentions[10:], teacher_attentions[10:]):
+                    # student_att = torch.where(student_att <= -1e2, torch.zeros_like(student_att), student_att, )
+                    # teacher_att = torch.where(teacher_att <= -1e2, torch.zeros_like(teacher_att), teacher_att)
+                    tmp_loss = loss_mse(student_att, teacher_att)
+                    att_loss += tmp_loss
+
+                for student_rep, teacher_rep in zip(student_hidden_states[10:], teacher_hidden_states[10:]):
+                    tmp_loss = loss_mse(student_rep, teacher_rep)
+                    rep_loss += tmp_loss                        
+
+                cls_loss = soft_cross_entropy(
+                    student_logits / args.temperature, teacher_logits / args.temperature)
+            
+                loss = rep_loss + att_loss + cls_loss
+            else:
+                loss = student_loss
+                assert loss, "The switch of loss computation is closed because of kd"                
+
+            # loss = outputs.loss
             loss = loss / args.gradient_accumulation_steps
+            tr_att_loss += att_loss.item()
+            tr_rep_loss += rep_loss.item()
+            tr_cls_loss += cls_loss.item()
+            tr_loss += loss.item()
+
             accelerator.backward(loss)
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
-                progress_bar.update(1)
+                # progress_bar.update(1)
                 completed_steps += 1
+
+                if pruner:
+                   pruner.prune()
+
+            if completed_steps % args.eval_step == 0:
+                if accelerator.is_main_process:
+	                    # optimized step, loss, att_loss, rep_loss, cls loss, tr_loss, tr_att_loss, tr_rep_loss, tr_cls_loss 
+                    logger.info("{:0>6d}/{:0>6d}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}".format(
+                        completed_steps,
+                        args.max_train_steps, 
+                        loss.item(),
+                        att_loss.item(),
+                        rep_loss.item(),
+                        cls_loss.item(),
+                        tr_loss / completed_steps,
+                        tr_att_loss / completed_steps,
+                        tr_rep_loss / completed_steps,
+                        tr_cls_loss / completed_steps)
+                    )
+
+                if pruner and accelerator.is_main_process:
+                    layer_sparse_rate, total_sparse_rate = pruner.sparsity()
+                    logger.info('\nepoch %d; step=%d; weight sparsity=%s; layer weight sparsity=%s\n' % (epoch, completed_steps, total_sparse_rate, layer_sparse_rate))
+
+                model.eval()
+                for step, batch in enumerate(eval_dataloader):
+                    outputs = model(**batch)
+                    predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
+                    metric.add_batch(
+                        predictions=accelerator.gather(predictions),
+                        references=accelerator.gather(batch["labels"]),
+                    )
+
+                eval_metric = metric.compute()
+                logger.info(f"epoch {epoch}, step {completed_steps}/{args.max_train_steps}: {eval_metric}")
 
             if completed_steps >= args.max_train_steps:
                 break
-
-        model.eval()
-        for step, batch in enumerate(eval_dataloader):
-            outputs = model(**batch)
-            predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
-            metric.add_batch(
-                predictions=accelerator.gather(predictions),
-                references=accelerator.gather(batch["labels"]),
-            )
-
-        eval_metric = metric.compute()
-        logger.info(f"epoch {epoch}: {eval_metric}")
 
         if args.push_to_hub and epoch < args.num_train_epochs - 1:
             accelerator.wait_for_everyone()
@@ -453,9 +625,7 @@ def main():
             unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
             if accelerator.is_main_process:
                 tokenizer.save_pretrained(args.output_dir)
-                repo.push_to_hub(
-                    commit_message=f"Training in progress epoch {epoch}", blocking=False, auto_lfs_prune=True
-                )
+                repo.push_to_hub(commit_message=f"Training in progress epoch {epoch}", blocking=False)
 
     if args.output_dir is not None:
         accelerator.wait_for_everyone()
@@ -464,7 +634,7 @@ def main():
         if accelerator.is_main_process:
             tokenizer.save_pretrained(args.output_dir)
             if args.push_to_hub:
-                repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
+                repo.push_to_hub(commit_message="End of training")
 
     if args.task_name == "mnli":
         # Final evaluation on mismatched validation set
@@ -485,7 +655,6 @@ def main():
 
         eval_metric = metric.compute()
         logger.info(f"mnli-mm: {eval_metric}")
-
 
 if __name__ == "__main__":
     main()
