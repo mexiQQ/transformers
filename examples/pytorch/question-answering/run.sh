@@ -67,7 +67,7 @@ OMP_NUM_THREADS=1 CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch run_qa_no_train
   --max_seq_length 248 \
   --eval_step 200 \
   --doc_stride 128 \
-  --output_dir /content/drive/MyDrive/moffett.ai/transformers-experiments \
+  --output_dir /content/drive/MyDrive/moffett.ai/transformers-experiments/question-answering \
   --pruning_sparsity 0.9375 \
   --prune \
   --pruning_epochs 160 \
