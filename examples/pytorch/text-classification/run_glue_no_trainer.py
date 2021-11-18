@@ -18,6 +18,7 @@ import logging
 import math
 import os
 import random
+import torch
 from pathlib import Path
 
 import datasets
@@ -40,6 +41,7 @@ from transformers import (
     get_scheduler,
     set_seed,
 )
+from datetime import datetime
 from pruner import Prune
 from transformers.file_utils import get_full_repo_name
 from transformers.utils.versions import require_version
@@ -298,6 +300,7 @@ def main():
         config=config,
     )
 
+    teacher = None
     if args.kd:
         teacher = AutoModelForSequenceClassification.from_pretrained(
             args.model_name_or_path,
@@ -307,7 +310,6 @@ def main():
         teacher.eval()
 
     if args.jiant_prepruned_weight:
-        import torch
         weights_dict = torch.load(args.jiant_prepruned_weight)
         keys = list(weights_dict.keys())
 
@@ -437,9 +439,14 @@ def main():
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
 
     # Prepare everything with our `accelerator`.
-    model, teacher, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
-        model, teacher, optimizer, train_dataloader, eval_dataloader
-    )
+    if args.kd:
+      model, teacher, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
+          model, teacher, optimizer, train_dataloader, eval_dataloader
+      )
+    else:
+      model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
+          model, optimizer, train_dataloader, eval_dataloader
+      )
 
     # Note -> the training dataloader needs to be prepared before we grab his length below (cause its length will be
     # shorter in multiprocess)
@@ -520,8 +527,8 @@ def main():
     loss_mse = MSELoss()
     for epoch in range(args.num_train_epochs):
         model.train()
-        for step, batch in enumerate(train_dataloader, output_hidden_states=True, output_attentions=True):
-            outputs = model(**batch)
+        for step, batch in enumerate(train_dataloader):
+            outputs = model(**batch, output_hidden_states=True, output_attentions=True)
             student_loss = outputs.loss
             student_logits = outputs.logits
             student_hidden_states = outputs.hidden_states
@@ -576,7 +583,7 @@ def main():
                 if pruner:
                    pruner.prune()
 
-            if completed_steps % args.eval_step == 0:
+            if completed_steps % 200 == 0:
                 if accelerator.is_main_process:
 	                    # optimized step, loss, att_loss, rep_loss, cls loss, tr_loss, tr_att_loss, tr_rep_loss, tr_cls_loss 
                     logger.info("{:0>6d}/{:0>6d}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}".format(
