@@ -157,8 +157,11 @@ def parse_args():
 
     parser.add_argument('--jiant_prepruned_weight', type=str, default="")
     parser.add_argument("--eval_step", default=200, type=int, help="eval step.")
+    
     parser.add_argument('--temperature', type=float, default=1.)
     parser.add_argument('--kd', action='store_true')
+    parser.add_argument('--sift', action='store_true')
+    parser.add_argument("--sift_version", default=0, type=int, help="1,2,3")
     parser.add_argument('--prune', action='store_true')
     parser.add_argument('--extract_mask', action='store_true')
     # parser.add_argument('--early_stop', action='store_true')
@@ -232,7 +235,7 @@ def main():
             os.makedirs(args.output_dir, exist_ok=True)
 
     if accelerator.is_main_process:
-        logfilename = 'log_dd{}_gs{}_bs{}_lr{}_sp{}_{}.txt'.format(args.deploy_device, args.group_size, args.per_device_train_batch_size, args.learning_rate, args.pruning_sparsity, datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
+        logfilename = 'log_sift_{}_version_{}_dd{}_gs{}_bs{}_lr{}_sp{}_{}.txt'.format(args.sift, args.sift_version, args.deploy_device, args.group_size, args.per_device_train_batch_size, args.learning_rate, args.pruning_sparsity, datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
         logfilename = os.path.join(args.output_dir, logfilename)
         handler = logging.FileHandler(logfilename)
         logger.addHandler(handler)
@@ -241,6 +244,14 @@ def main():
 
     logger.info(accelerator.state)
     accelerator.wait_for_everyone()
+
+    if args.sift:
+        if args.sift_version == 1:
+            from sift import AdversarialLearner, hook_sift_layer
+        elif args.sift_version == 2:
+            from sift_v2 import AdversarialLearner, hook_sift_layer
+        elif args.sift_version == 3:
+            from sift_v3 import AdversarialLearner, hook_sift_layer
 
     # Get the datasets: you can either provide your own CSV/JSON training and evaluation files (see below)
     # or specify a GLUE benchmark task (the dataset will be downloaded automatically from the datasets Hub).
@@ -423,6 +434,7 @@ def main():
         train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
     )
     eval_dataloader = DataLoader(eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
+    eval_train_dataloader = DataLoader(train_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
@@ -526,6 +538,21 @@ def main():
     tr_loss = 0
 
     loss_mse = MSELoss()
+
+    if args.sift:
+        if args.sift_version == 1:
+            adv_modules = hook_sift_layer(model, hidden_size=768)
+            adv = AdversarialLearner(model, adv_modules)
+            def logits_fn(model, *wargs, **kwargs):
+                outputs = model(*wargs, **kwargs)
+                return outputs.logits
+        else:
+            adv_modules = hook_sift_layer(model, teacher, hidden_size=768)
+            adv = AdversarialLearner(model, teacher, adv_modules)
+            def logits_fn(model, *wargs, **kwargs):
+                outputs = model(*wargs, **kwargs)
+                return outputs.logits
+
     for epoch in range(args.num_train_epochs):
         model.train()
         for step, batch in enumerate(train_dataloader):
@@ -566,6 +593,12 @@ def main():
                 loss = student_loss
                 assert loss, "The switch of loss computation is closed because of kd"                
 
+            if args.sift:
+                if args.sift_version == 1:
+                    loss += adv.loss(student_logits, logits_fn, **batch)
+                else:
+                    loss += adv.loss(student_logits, teacher_logits, logits_fn, **batch)
+
             # loss = outputs.loss
             loss = loss / args.gradient_accumulation_steps
             tr_att_loss += att_loss.item()
@@ -605,6 +638,11 @@ def main():
                     logger.info('\nepoch %d; step=%d; weight sparsity=%s; layer weight sparsity=%s\n' % (epoch, completed_steps, total_sparse_rate, layer_sparse_rate))
 
                 model.eval()
+                metric = None
+                if args.task_name is not None:
+	                metric = load_metric("glue", args.task_name)
+                else:
+	                metric = load_metric("accuracy")
                 for step, batch in enumerate(eval_dataloader):
                     outputs = model(**batch)
                     predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
@@ -612,9 +650,9 @@ def main():
                         predictions=accelerator.gather(predictions),
                         references=accelerator.gather(batch["labels"]),
                     )
-
                 eval_metric = metric.compute()
                 logger.info(f"epoch {epoch}, step {completed_steps}/{args.max_train_steps}: {eval_metric}")
+                model.train()
 
             if completed_steps >= args.max_train_steps:
                 break
@@ -627,6 +665,41 @@ def main():
                 tokenizer.save_pretrained(args.output_dir)
                 repo.push_to_hub(commit_message=f"Training in progress epoch {epoch}", blocking=False)
 
+    model.eval()
+    metric = None
+    if args.task_name is not None:
+        metric = load_metric("glue", args.task_name)
+    else:
+        metric = load_metric("accuracy")
+    for step, batch in enumerate(eval_train_dataloader):
+        outputs = model(**batch)
+        predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
+        metric.add_batch(
+            predictions=accelerator.gather(predictions),
+            references=accelerator.gather(batch["labels"]),
+        )
+    eval_metric = metric.compute()
+    logger.info(f"Train Result: {eval_metric}")  
+
+    logger.info("***** Running evaluation *****")
+    logger.info(f"  Num examples = {len(eval_dataset)}")
+    logger.info(f"  Num Epochs = {args.num_train_epochs}")
+    logger.info(f"  Instantaneous batch size per device = {args.per_device_eval_batch_size}")
+    metric = None
+    if args.task_name is not None:
+        metric = load_metric("glue", args.task_name)
+    else:
+        metric = load_metric("accuracy")
+    for step, batch in enumerate(eval_dataloader):
+        outputs = model(**batch)
+        predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
+        metric.add_batch(
+            predictions=accelerator.gather(predictions),
+            references=accelerator.gather(batch["labels"]),
+        )
+    eval_metric = metric.compute()
+    logger.info(f"DEV Result: {eval_metric}")    
+
     if args.output_dir is not None:
         accelerator.wait_for_everyone()
         unwrapped_model = accelerator.unwrap_model(model)
@@ -636,6 +709,11 @@ def main():
             if args.push_to_hub:
                 repo.push_to_hub(commit_message="End of training")
 
+    metric = None
+    if args.task_name is not None:
+        metric = load_metric("glue", args.task_name)
+    else:
+        metric = load_metric("accuracy") 
     if args.task_name == "mnli":
         # Final evaluation on mismatched validation set
         eval_dataset = processed_datasets["validation_mismatched"]
