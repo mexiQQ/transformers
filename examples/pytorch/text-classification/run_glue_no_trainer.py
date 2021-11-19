@@ -452,14 +452,9 @@ def main():
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
 
     # Prepare everything with our `accelerator`.
-    if args.kd:
-      model, teacher, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
-          model, teacher, optimizer, train_dataloader, eval_dataloader
-      )
-    else:
-      model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
-          model, optimizer, train_dataloader, eval_dataloader
-      )
+    model, teacher, optimizer, train_dataloader, eval_dataloader, eval_train_dataloader = accelerator.prepare(
+        model, teacher, optimizer, train_dataloader, eval_dataloader, eval_train_dataloader
+    )
 
     # Note -> the training dataloader needs to be prepared before we grab his length below (cause its length will be
     # shorter in multiprocess)
