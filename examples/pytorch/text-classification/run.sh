@@ -17,4 +17,6 @@ python run_glue_no_trainer.py \
   --pruning_frequency 20 \
   --deploy_device none \
   --group_size 64 \
-  --kd
+  --kd \
+  --sift \
+  --sift_version 1
