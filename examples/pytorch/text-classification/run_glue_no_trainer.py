@@ -177,6 +177,7 @@ def parse_args():
     parser.add_argument('--pruning_frequency',type=int, default=800, help='also known as bank_size')
     parser.add_argument('--pruning_epochs',type=int, default=0, help='pruning epochs')
     parser.add_argument('--local_rank',type=int, default=0, help='rank')
+    parser.add_argument('--do_eval',action='store_true')
 
     args = parser.parse_args()
 
@@ -415,6 +416,9 @@ def main():
     train_dataset = processed_datasets["train"]
     eval_dataset = processed_datasets["validation_matched" if args.task_name == "mnli" else "validation"]
 
+    train_dataset = train_dataset.select(range(500))
+    eval_dataset = train_dataset.select(range(50))
+
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 3):
         logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
@@ -494,7 +498,8 @@ def main():
         pruner = Prune(
             model=model, 
             pretrain_step=0,
-            sparse_step=num_update_steps_per_epoch * args.pruning_epochs,
+            # sparse_step=num_update_steps_per_epoch * args.pruning_epochs,
+            sparse_step=10,
             current_step=args.current_step,
             frequency=args.pruning_frequency,
             prune_dict=prune_dict,
@@ -530,6 +535,7 @@ def main():
     tr_att_loss = 0
     tr_rep_loss = 0
     tr_cls_loss = 0
+    tr_adv_loss = 0
     tr_loss = 0
 
     loss_mse = MSELoss()
@@ -548,117 +554,124 @@ def main():
                 outputs = model(*wargs, **kwargs)
                 return outputs.logits
 
-    for epoch in range(args.num_train_epochs):
-        model.train()
-        for step, batch in enumerate(train_dataloader):
-            outputs = model(**batch, output_hidden_states=True, output_attentions=True)
-            student_loss = outputs.loss
-            student_logits = outputs.logits
-            student_hidden_states = outputs.hidden_states
-            student_attentions = outputs.attentions
+    if not args.do_eval:
+      for epoch in range(args.num_train_epochs):
+          model.train()
+          for step, batch in enumerate(train_dataloader):
+              outputs = model(**batch, output_hidden_states=True, output_attentions=True)
+              student_loss = outputs.loss
+              student_logits = outputs.logits
+              student_hidden_states = outputs.hidden_states
+              student_attentions = outputs.attentions
 
-            if teacher:
-                with torch.no_grad():
-                    teacher_outputs = teacher(**batch, output_hidden_states=True, output_attentions=True)
-                    teacher_logits = teacher_outputs.logits
-                    teacher_hidden_states = teacher_outputs.hidden_states
-                    teacher_attentions = teacher_outputs.attentions
+              if teacher:
+                  with torch.no_grad():
+                      teacher_outputs = teacher(**batch, output_hidden_states=True, output_attentions=True)
+                      teacher_logits = teacher_outputs.logits
+                      teacher_hidden_states = teacher_outputs.hidden_states
+                      teacher_attentions = teacher_outputs.attentions
 
-            att_loss = torch.zeros(1).cuda()
-            rep_loss = torch.zeros(1).cuda()
-            cls_loss = torch.zeros(1).cuda()
-            loss = torch.zeros(1).cuda()
-            
-            if args.kd:
-                for student_att, teacher_att in zip(student_attentions[10:], teacher_attentions[10:]):
-                    # student_att = torch.where(student_att <= -1e2, torch.zeros_like(student_att), student_att, )
-                    # teacher_att = torch.where(teacher_att <= -1e2, torch.zeros_like(teacher_att), teacher_att)
-                    tmp_loss = loss_mse(student_att, teacher_att)
-                    att_loss += tmp_loss
+              att_loss = torch.zeros(1).cuda()
+              rep_loss = torch.zeros(1).cuda()
+              cls_loss = torch.zeros(1).cuda()
+              adv_loss = torch.zeros(1).cuda()
+              loss = torch.zeros(1).cuda()
+              
+              if args.kd:
+                  for student_att, teacher_att in zip(student_attentions[10:], teacher_attentions[10:]):
+                      # student_att = torch.where(student_att <= -1e2, torch.zeros_like(student_att), student_att, )
+                      # teacher_att = torch.where(teacher_att <= -1e2, torch.zeros_like(teacher_att), teacher_att)
+                      tmp_loss = loss_mse(student_att, teacher_att)
+                      att_loss += tmp_loss
 
-                for student_rep, teacher_rep in zip(student_hidden_states[10:], teacher_hidden_states[10:]):
-                    tmp_loss = loss_mse(student_rep, teacher_rep)
-                    rep_loss += tmp_loss                        
+                  for student_rep, teacher_rep in zip(student_hidden_states[10:], teacher_hidden_states[10:]):
+                      tmp_loss = loss_mse(student_rep, teacher_rep)
+                      rep_loss += tmp_loss                        
 
-                cls_loss = soft_cross_entropy(
-                    student_logits / args.temperature, teacher_logits / args.temperature)
-            
-                loss = rep_loss + att_loss + cls_loss
-            else:
-                loss = student_loss
-                assert loss, "The switch of loss computation is closed because of kd"                
+                  cls_loss = soft_cross_entropy(
+                      student_logits / args.temperature, teacher_logits / args.temperature)
+              
+                  loss = rep_loss + att_loss + cls_loss
+              else:
+                  loss = student_loss
+                  assert loss, "The switch of loss computation is closed because of kd"                
 
-            if args.sift:
-                if args.sift_version == 1:
-                    loss += adv.loss(student_logits, logits_fn, **batch)
-                else:
-                    loss += adv.loss(student_logits, teacher_logits, logits_fn, **batch)
+              if args.sift:
+                  if args.sift_version == 1:
+                      adv_loss = adv.loss(student_logits, logits_fn, **batch)
+                      loss += adv_loss
+                  else:
+                      adv_loss = adv.loss(student_logits, teacher_logits, logits_fn, **batch)
+                      loss += adv_loss
 
-            # loss = outputs.loss
-            loss = loss / args.gradient_accumulation_steps
-            tr_att_loss += att_loss.item()
-            tr_rep_loss += rep_loss.item()
-            tr_cls_loss += cls_loss.item()
-            tr_loss += loss.item()
+              # loss = outputs.loss
+              loss = loss / args.gradient_accumulation_steps
+              tr_att_loss += att_loss.item()
+              tr_rep_loss += rep_loss.item()
+              tr_cls_loss += cls_loss.item()
+              tr_adv_loss ++ adv_loss.item()
+              tr_loss += loss.item()
 
-            accelerator.backward(loss)
-            if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-                # progress_bar.update(1)
-                completed_steps += 1
+              accelerator.backward(loss)
+              if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+                  optimizer.step()
+                  lr_scheduler.step()
+                  optimizer.zero_grad()
+                  # progress_bar.update(1)
+                  completed_steps += 1
 
-                if pruner:
-                   pruner.prune()
+                  if pruner:
+                    pruner.prune()
 
-            if completed_steps % args.eval_step == 0:
-                if accelerator.is_main_process:
-	                    # optimized step, loss, att_loss, rep_loss, cls loss, tr_loss, tr_att_loss, tr_rep_loss, tr_cls_loss 
-                    logger.info("{:0>6d}/{:0>6d}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}".format(
-                        completed_steps,
-                        args.max_train_steps, 
-                        loss.item(),
-                        att_loss.item(),
-                        rep_loss.item(),
-                        cls_loss.item(),
-                        tr_loss / completed_steps,
-                        tr_att_loss / completed_steps,
-                        tr_rep_loss / completed_steps,
-                        tr_cls_loss / completed_steps)
-                    )
+              if completed_steps % args.eval_step == 0:
+                  if accelerator.is_main_process:
+                        # optimized step, loss, att_loss, rep_loss, cls loss, tr_loss, tr_att_loss, tr_rep_loss, tr_cls_loss 
+                      logger.info("{:0>6d}/{:0>6d}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}".format(
+                          completed_steps,
+                          args.max_train_steps, 
+                          loss.item(),
+                          adv_loss.item(),
+                          att_loss.item(),
+                          rep_loss.item(),
+                          cls_loss.item(),
+                          tr_loss / completed_steps,
+                          tr_adv_loss / completed_steps,
+                          tr_att_loss / completed_steps,
+                          tr_rep_loss / completed_steps,
+                          tr_cls_loss / completed_steps)
+                      )
 
-                if pruner and accelerator.is_main_process:
-                    layer_sparse_rate, total_sparse_rate = pruner.sparsity()
-                    logger.info('\nepoch %d; step=%d; weight sparsity=%s; layer weight sparsity=%s\n' % (epoch, completed_steps, total_sparse_rate, layer_sparse_rate))
+                  # if pruner and accelerator.is_main_process:
+                  #     layer_sparse_rate, total_sparse_rate = pruner.sparsity()
+                      # logger.info('\nepoch %d; step=%d; weight sparsity=%s; layer weight sparsity=%s\n' % (epoch, completed_steps, total_sparse_rate, layer_sparse_rate))
 
-                model.eval()
-                metric = None
-                if args.task_name is not None:
-	                metric = load_metric("glue", args.task_name)
-                else:
-	                metric = load_metric("accuracy")
-                for step, batch in enumerate(eval_dataloader):
-                    outputs = model(**batch)
-                    predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
-                    metric.add_batch(
-                        predictions=accelerator.gather(predictions),
-                        references=accelerator.gather(batch["labels"]),
-                    )
-                eval_metric = metric.compute()
-                logger.info(f"epoch {epoch}, step {completed_steps}/{args.max_train_steps}: {eval_metric}")
-                model.train()
+                  # model.eval()
+                  # metric = None
+                  # if args.task_name is not None:
+                  #   metric = load_metric("glue", args.task_name)
+                  # else:
+                  #   metric = load_metric("accuracy")
+                  # for step, batch in enumerate(eval_dataloader):
+                  #     outputs = model(**batch)
+                  #     predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
+                  #     metric.add_batch(
+                  #         predictions=accelerator.gather(predictions),
+                  #         references=accelerator.gather(batch["labels"]),
+                  #     )
+                  # eval_metric = metric.compute()
+                  # logger.info(f"epoch {epoch}, step {completed_steps}/{args.max_train_steps}: {eval_metric}")
+                  # model.train()
 
-            if completed_steps >= args.max_train_steps:
-                break
+              if completed_steps >= args.max_train_steps:
+                  break
 
-        if args.push_to_hub and epoch < args.num_train_epochs - 1:
-            accelerator.wait_for_everyone()
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
-            if accelerator.is_main_process:
-                tokenizer.save_pretrained(args.output_dir)
-                repo.push_to_hub(commit_message=f"Training in progress epoch {epoch}", blocking=False)
+          if args.push_to_hub and epoch < args.num_train_epochs - 1:
+              accelerator.wait_for_everyone()
+              unwrapped_model = accelerator.unwrap_model(model)
+              unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
+              if accelerator.is_main_process:
+                  tokenizer.save_pretrained(args.output_dir)
+                  repo.push_to_hub(commit_message=f"Training in progress epoch {epoch}", blocking=False)
 
     model.eval()
     metric = None
