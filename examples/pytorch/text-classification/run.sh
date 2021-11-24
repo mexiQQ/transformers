@@ -6,8 +6,8 @@ python run_glue_no_trainer.py \
   --max_length 128 \
   --per_device_train_batch_size 32 \
   --per_device_eval_batch_size 32 \
-  --seed 43 \
-  --learning_rate 3e-5 \
+  --learning_rate 1e-3 \
+  --seed 42 \
   --eval_step 9 \
   --num_train_epochs 10 \
   --output_dir /content/drive/MyDrive/moffett.ai/transformers-experiments/text-classification \
@@ -22,3 +22,5 @@ python run_glue_no_trainer.py \
   # --sift \
   # --sift_version 1 \
   # --do_eval
+    # 
+
