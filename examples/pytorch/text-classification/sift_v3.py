@@ -164,7 +164,7 @@ class AdversarialLearner:
     
     # pert_loss = loss_fn(pert_logits, target.detach()).sum()
     # JS loss
-    pert_loss = 1/2 * (-kl(pert_logits, target.detach()) + kl(teacher_pert_logits, teacher_target.detach())).sum()
+    pert_loss = (1 - kl(pert_logits, target.detach()) + kl(teacher_pert_logits, teacher_target.detach())).sum()
 
     pert_loss.backward()
     for m in self.adv_modules:
@@ -176,7 +176,7 @@ class AdversarialLearner:
     teacher_pert_logits = logits_fn(self.teacher, *wargs, **kwargs)
 
     # pert_loss = symmetric_kl(pert_logits, target)
-    pert_loss = 1/2 * (-kl(pert_logits, target.detach()) + kl(teacher_pert_logits, teacher_target.detach())).sum()
+    pert_loss = mse(pert_logits, teacher_pert_logits)
 
     self.cleanup()
     return pert_loss.mean()
