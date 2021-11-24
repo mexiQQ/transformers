@@ -609,7 +609,7 @@ def main():
               tr_att_loss += att_loss.item()
               tr_rep_loss += rep_loss.item()
               tr_cls_loss += cls_loss.item()
-              tr_adv_loss ++ adv_loss.item()
+              tr_adv_loss += adv_loss.item()
               tr_loss += loss.item()
 
               accelerator.backward(loss)
