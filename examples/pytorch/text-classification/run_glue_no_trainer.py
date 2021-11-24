@@ -417,7 +417,7 @@ def main():
     eval_dataset = processed_datasets["validation_matched" if args.task_name == "mnli" else "validation"]
 
     train_dataset = train_dataset.select(range(500))
-    eval_dataset = train_dataset.select(range(50))
+    # eval_dataset = train_dataset.select(range(200))
 
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 3):
@@ -643,7 +643,7 @@ def main():
 
                   # if pruner and accelerator.is_main_process:
                   #     layer_sparse_rate, total_sparse_rate = pruner.sparsity()
-                      # logger.info('\nepoch %d; step=%d; weight sparsity=%s; layer weight sparsity=%s\n' % (epoch, completed_steps, total_sparse_rate, layer_sparse_rate))
+                  #     logger.info('\nepoch %d; step=%d; weight sparsity=%s; layer weight sparsity=%s\n' % (epoch, completed_steps, total_sparse_rate, layer_sparse_rate))
 
                   # model.eval()
                   # metric = None
