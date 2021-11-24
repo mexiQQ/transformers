@@ -178,8 +178,7 @@ class AdversarialLearner:
     teacher_pert_logits = logits_fn(self.teacher, *wargs, **kwargs)
 
     # pert_loss = symmetric_kl(pert_logits, target)
-    M = 1/2 * (pert_logits + teacher_pert_logits)
-    pert_loss = 1 - 1/2 * (kl(pert_logits, M) + kl(teacher_pert_logits, M))
+    pert_loss = mse(pert_logits, teacher_pert_logits)
 
     self.cleanup()
     return pert_loss.mean()
